@@ -5,7 +5,7 @@ import plotly.express as px
 from datetime import datetime, timedelta
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="多資產成長模擬器 Pro+ (終極版)", layout="wide", page_icon="📈")
+st.set_page_config(page_title="多資產成長模擬器 Pro+ (穩定版)", layout="wide", page_icon="📈")
 
 # --- 側邊欄：參數設定 ---
 st.sidebar.header("⚙️ 模擬參數設定")
@@ -64,43 +64,55 @@ threshold_pct = 0.05
 if threshold_mode:
     threshold_pct = st.sidebar.slider("容許值 (%)", 1, 20, 5) / 100
 
-# --- 核心函數：下載數據 (增強版) ---
-def get_data(ticker_list, start, end):
-    # 嘗試下載
+# --- 核心函數：下載數據 (修復 KeyError 問題) ---
+def get_data_safe(ticker_list, start, end):
     try:
-        # auto_adjust=False 確保我們能拿到原始欄位
+        # 1. 嘗試下載，強制 auto_adjust=False 以保留原始欄位結構
         df = yf.download(ticker_list, start=start, end=end, progress=False, auto_adjust=False)
         
-        # 判斷要用哪個價格
-        if 'Adj Close' in df.columns:
-            data = df['Adj Close']
-        elif 'Close' in df.columns:
-            data = df['Close']
-            st.toast("⚠️ 注意：找不到調整後收盤價 (Adj Close)，改用收盤價 (Close) 計算。", icon="ℹ️")
-        else:
-            return pd.DataFrame() # 真的沒資料
+        if df.empty:
+            return pd.DataFrame()
 
-        # 處理單檔股票的情況 (Series轉DataFrame)
+        # 2. 判斷並提取股價數據 (解決 KeyError: 'Adj Close')
+        target_col = None
+        
+        # 檢查欄位結構 (MultiIndex 或是 Flat Index)
+        # 優先找 Adj Close
+        if 'Adj Close' in df.columns:
+            target_col = 'Adj Close'
+        elif 'Close' in df.columns:
+            target_col = 'Close'
+            st.toast("⚠️ 提示：找不到 'Adj Close'，系統自動改用 'Close' 進行計算。", icon="ℹ️")
+        else:
+            # 萬一真的都沒有，嘗試直接抓取第一層數據 (極端情況)
+            st.error("錯誤：下載的資料中沒有收盤價欄位。")
+            return pd.DataFrame()
+
+        # 提取數據
+        data = df[target_col]
+
+        # 3. 格式標準化 (處理單檔 vs 多檔的差異)
         if isinstance(data, pd.Series):
+            # 如果是 Series (單檔)，轉成 DataFrame 並重新命名欄位
             data = data.to_frame()
             data.columns = ticker_list
-        elif isinstance(data, pd.DataFrame) and len(ticker_list) == 1:
-            data.columns = ticker_list # 強制重命名欄位，避免 yfinance 格式跑掉
-
-        # 關鍵修復：先填補空值 (Forward Fill)，而不是直接丟掉
-        # 這樣即使某支股票某天沒開盤，也會用前一天的價格算，不會導致整行被刪除
-        data = data.ffill()
+        elif isinstance(data, pd.DataFrame):
+            # 如果是 DataFrame，確保欄位名稱正確
+            if len(ticker_list) == 1 and len(data.columns) == 1:
+                 data.columns = ticker_list
         
-        # 最後再刪除「真的完全沒有數據」的日期 (例如上市前)
-        data = data.dropna()
+        # 4. 補值與清洗
+        data = data.ffill() # 補前值
+        data = data.dropna() # 刪除仍為空的行
         
         return data
+
     except Exception as e:
-        st.error(f"下載過程發生錯誤: {e}")
+        st.error(f"數據處理發生錯誤: {e}")
         return pd.DataFrame()
 
 # --- 主程式 ---
-st.title("📈 多資產成長模擬器 (終極穩定版)")
+st.title("📈 多資產成長模擬器 Pro+ (穩定版)")
 
 if st.button("🚀 開始模擬", type="primary"):
     if weight_cash < 0:
@@ -110,15 +122,21 @@ if st.button("🚀 開始模擬", type="primary"):
     else:
         with st.spinner('正在下載並修復資料...'):
             ticker_list = [a['ticker'] for a in assets]
-            data = get_data(ticker_list, requested_start_date, end_date)
+            
+            # 使用新的安全下載函數
+            data = get_data_safe(ticker_list, requested_start_date, end_date)
             
             if data.empty:
-                st.error(f"❌ 依然抓不到資料。請確認：\n1. 股票代號是否正確 (台股需加 .TW，如 00662.TW)\n2. 這些標的是否有重疊的上市時間。")
+                st.error(f"❌ 無法取得資料。請確認股票代號 {ticker_list} 是否正確 (台股需加 .TW)。")
             else:
                 # 顯示實際開始日期
                 actual_start = data.index[0]
-                if actual_start.tz_localize(None) > pd.Timestamp(requested_start_date).tz_localize(None):
-                    st.warning(f"⚠️ 資料起始日自動調整為 **{actual_start.strftime('%Y-%m-%d')}** (以最晚上市的標的為準)")
+                # 簡單的時間比較 (去除時區資訊以免報錯)
+                act_ts = actual_start.tz_localize(None) if actual_start.tzinfo else actual_start
+                req_ts = pd.Timestamp(requested_start_date).tz_localize(None)
+
+                if act_ts > req_ts:
+                    st.warning(f"⚠️ 資料起始日自動調整為 **{actual_start.strftime('%Y-%m-%d')}** (以數據最完整的日期為準)")
 
                 # 初始化
                 current_cash = (initial_capital + loan_amount) * (weight_cash / 100)
@@ -130,15 +148,15 @@ if st.button("🚀 開始模擬", type="primary"):
                 
                 for asset in assets:
                     t = asset['ticker']
-                    if t not in first_prices:
-                        st.error(f"錯誤：找不到 {t} 的價格數據。")
+                    # 防呆：確認該股票在資料中
+                    if t not in data.columns:
+                        st.error(f"錯誤：資料中遺失 {t} 的欄位，請檢查代號。")
                         valid_simulation = False
                         break
                     
                     price = first_prices[t]
                     if pd.isna(price) or price <= 0:
-                        # 再次防呆：如果第一天價格是 NaN，往後找一天有價格的
-                        price = data[t].dropna().iloc[0]
+                        price = data[t].dropna().iloc[0] # 往後找有效價格
                         
                     shares[t] = ((initial_capital + loan_amount) * asset['weight']) / price
 
@@ -163,9 +181,11 @@ if st.button("🚀 開始模擬", type="primary"):
                         stock_val = 0
                         asset_vals = {}
                         for t in ticker_list:
-                            val = shares[t] * row[t]
-                            asset_vals[t] = val
-                            stock_val += val
+                            # 再次確認欄位存在
+                            if t in row:
+                                val = shares[t] * row[t]
+                                asset_vals[t] = val
+                                stock_val += val
                         
                         total_assets = current_cash + stock_val
                         net_worth = total_assets - loan_amount
@@ -178,24 +198,25 @@ if st.button("🚀 開始模擬", type="primary"):
                         if threshold_mode and total_assets > 0:
                             for asset in assets:
                                 t = asset['ticker']
-                                target = asset['weight']
-                                curr_w = asset_vals[t] / total_assets
-                                if abs(curr_w - target) > threshold_pct:
-                                    do_rebalance = True
-                                    break
+                                if t in asset_vals:
+                                    target = asset['weight']
+                                    curr_w = asset_vals[t] / total_assets
+                                    if abs(curr_w - target) > threshold_pct:
+                                        do_rebalance = True
+                                        break
                         
                         if do_rebalance and total_assets > 0:
                             cost_stock = 0
                             for asset in assets:
                                 t = asset['ticker']
-                                target_val = total_assets * asset['weight']
-                                shares[t] = target_val / row[t]
-                                cost_stock += target_val
+                                if t in row:
+                                    target_val = total_assets * asset['weight']
+                                    shares[t] = target_val / row[t]
+                                    cost_stock += target_val
                             current_cash = total_assets - cost_stock
 
                         # E. 記錄
                         rec = {"Date": date, "Net Worth": net_worth, "Total Invested": total_invested, "Cash": current_cash}
-                        # rec.update(asset_vals) # 如果想看個別市值可解開
                         history.append(rec)
 
                     # 繪圖
