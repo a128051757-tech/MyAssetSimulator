@@ -13,19 +13,18 @@ st.sidebar.header("⚙️ 模擬參數設定")
 # 1. 時間設定
 years_back = st.sidebar.slider("回測年數 (若超過上市日將自動調整)", 1, 20, 5)
 end_date = datetime.now()
-# 預設起始日 (後續會根據資料實際狀況調整)
 requested_start_date = end_date - timedelta(days=years_back*365)
 
 # 2. 標的與配置 (動態生成 1~5 檔)
 st.sidebar.subheader("📊 資產配置")
 num_assets = st.sidebar.slider("選擇標的數量", 1, 5, 2)
 
-assets = [] # 儲存標的資訊的列表
+assets = [] 
 total_asset_weight = 0
 
 for i in range(num_assets):
     col1, col2 = st.sidebar.columns([1, 2])
-    # 預設值設定 (方便快速測試)
+    # 預設值設定
     default_ticker = "00662.TW" if i == 0 else ("00670L.TW" if i == 1 else "")
     default_weight = 40 if i == 0 else (30 if i == 1 else 10)
     
@@ -35,7 +34,9 @@ for i in range(num_assets):
         weight = st.slider(f"配置 %", 0, 100, default_weight, key=f"w_{i}")
     
     if ticker:
-        assets.append({'ticker': ticker, 'weight': weight / 100})
+        # 移除空格並轉大寫，避免代號錯誤
+        clean_ticker = ticker.strip().upper()
+        assets.append({'ticker': clean_ticker, 'weight': weight / 100})
         total_asset_weight += weight
 
 # 計算現金權重
@@ -53,10 +54,10 @@ cash_interest_rate = st.sidebar.number_input("💰 現金/短債年化報酬率 
 
 # 4. 槓桿設定
 use_leverage = st.sidebar.checkbox("啟用信貸/質押模擬")
-loan_amount = 0
-loan_rate = 0
+loan_amount = 0.0
+loan_rate = 0.0
 if use_leverage:
-    loan_amount = st.sidebar.number_input("初始借貸金額", value=0, step=100000)
+    loan_amount = st.sidebar.number_input("初始借貸金額", value=0.0, step=100000.0)
     loan_rate = st.sidebar.number_input("借貸年利率 (%)", value=2.5, step=0.1) / 100
 
 # 5. 再平衡策略
@@ -68,7 +69,7 @@ if threshold_mode:
     threshold_pct = st.sidebar.slider("偏移容許值 (%)", 1, 20, 5) / 100
 
 # --- 主程式邏輯 ---
-st.title("📈 多資產成長模擬器 (最多5檔 + 自動日期校正)")
+st.title("📈 多資產成長模擬器 Pro+ (修復版)")
 
 if st.button("🚀 開始模擬", type="primary"):
     if weight_cash < 0:
@@ -80,37 +81,57 @@ if st.button("🚀 開始模擬", type="primary"):
             try:
                 # 1. 下載資料
                 ticker_list = [a['ticker'] for a in assets]
-                # 為了確保能涵蓋所有日期，先寬鬆下載，再做交集
-                raw_data = yf.download(ticker_list, start=requested_start_date, end=end_date)['Adj Close']
                 
-                # 2. 自動日期校正 (關鍵步驟)
-                # dropna() 會移除任何有空值的列 -> 只保留所有標的都已經上市的日期
+                # --- 修正重點：處理 yfinance 下載格式問題 ---
+                raw_data = yf.download(ticker_list, start=requested_start_date, end=end_date, progress=False)['Adj Close']
+                
+                # 如果只有一檔股票，yfinance 會回傳 Series 或沒有 column 名稱的 DataFrame
+                # 這裡強制把它轉成以 ticker 為欄位的 DataFrame
+                if isinstance(raw_data, pd.Series):
+                    raw_data = raw_data.to_frame()
+                    raw_data.columns = ticker_list
+                elif isinstance(raw_data, pd.DataFrame) and len(ticker_list) == 1:
+                    # 如果是 DataFrame 但只有一欄，確保欄位名稱正確
+                    raw_data.columns = ticker_list
+                
+                # 2. 自動日期校正
                 data = raw_data.dropna()
                 
                 if data.empty:
-                    st.error("資料為空！可能是標的代號錯誤，或選定的標的之間沒有共同的上市時間重疊。")
+                    st.error(f"資料為空！請檢查股票代號 {ticker_list} 是否正確，或確認它們是否有重疊的上市時間。")
                 else:
                     # 抓取實際開始日期
                     actual_start_date = data.index[0]
-                    date_diff = actual_start_date - requested_start_date.replace(tzinfo=None) if hasattr(requested_start_date, 'tzinfo') else actual_start_date - pd.to_datetime(requested_start_date).replace(tzinfo=None)
                     
-                    # 顯示日期調整提示
-                    if actual_start_date > pd.Timestamp(requested_start_date).replace(tzinfo=None):
-                        st.warning(f"⚠️ 注意：由於部分標的上市時間較晚，回測起始日已自動調整為 **{actual_start_date.strftime('%Y-%m-%d')}** (所有標的皆有數據的日期)。")
+                    # 判斷日期 (兼容性寫法)
+                    req_start_ts = pd.Timestamp(requested_start_date).tz_localize(None)
+                    act_start_ts = actual_start_date.tz_localize(None) if actual_start_date.tzinfo else actual_start_date
+                    
+                    if act_start_ts > req_start_ts:
+                        st.warning(f"⚠️ 注意：回測起始日已自動調整為 **{actual_start_date.strftime('%Y-%m-%d')}** (所有標的皆有數據的日期)。")
                     
                     # 3. 初始化模擬
                     current_cash = (initial_capital + loan_amount) * (weight_cash / 100)
                     
-                    # 動態初始化股數
                     shares = {}
-                    # 使用第一筆有資料的股價來建倉
+                    # 確保取出的價格是 Series 格式 (即便只有一行)
                     first_prices = data.iloc[0]
+                    
                     for asset in assets:
                         t_name = asset['ticker']
                         t_w = asset['weight']
-                        # 初始買入金額 = 總資金 * 權重
                         allocation = (initial_capital + loan_amount) * t_w
-                        shares[t_name] = allocation / first_prices[t_name]
+                        # 防呆：確保能取到價格
+                        try:
+                            price = first_prices[t_name]
+                        except:
+                            # 萬一欄位名不對，嘗試直接取值
+                            price = first_prices.iloc[0] if len(assets) == 1 else 0
+                            
+                        if price > 0:
+                            shares[t_name] = allocation / price
+                        else:
+                            shares[t_name] = 0
                     
                     history = []
                     monthly_rate = loan_rate / 12
@@ -118,11 +139,11 @@ if st.button("🚀 開始模擬", type="primary"):
                     
                     # 4. 開始回測迴圈
                     for date, row in data.iterrows():
-                        # A. 現金生息 (日複利)
+                        # A. 現金生息
                         daily_interest = current_cash * (cash_interest_rate / 365)
                         current_cash += daily_interest
                         
-                        # B. 月初事件 (定期定額 & 借貸利息)
+                        # B. 月初事件
                         is_month_start = date.is_month_start
                         is_year_start = date.is_year_start
                         
@@ -134,15 +155,17 @@ if st.button("🚀 開始模擬", type="primary"):
                             if use_leverage:
                                 current_cash -= (loan_amount * monthly_rate)
 
-                        # C. 計算當前總市值
+                        # C. 計算市值
                         current_stock_value = 0
-                        asset_values = {} # 暫存各個資產當下價值
+                        asset_values = {}
                         
                         for asset in assets:
                             t_name = asset['ticker']
-                            val = shares[t_name] * row[t_name]
-                            asset_values[t_name] = val
-                            current_stock_value += val
+                            # 確保 row 裡面有該代號
+                            if t_name in row:
+                                val = shares[t_name] * row[t_name]
+                                asset_values[t_name] = val
+                                current_stock_value += val
                         
                         total_assets = current_cash + current_stock_value
                         net_worth = total_assets - loan_amount
@@ -150,25 +173,23 @@ if st.button("🚀 開始模擬", type="primary"):
                         # D. 判斷再平衡
                         do_rebalance = False
                         
-                        # 時間觸發
                         if rebalance_mode == "每月 (Monthly)" and is_month_start:
                             do_rebalance = True
                         elif rebalance_mode == "每年 (Yearly)" and is_year_start:
                             do_rebalance = True
                         
-                        # 閾值觸發 (檢查每一檔標的是否偏離)
                         if threshold_mode and total_assets > 0:
                             for asset in assets:
                                 t_name = asset['ticker']
-                                t_target_w = asset['weight']
-                                current_w = asset_values[t_name] / total_assets
-                                if abs(current_w - t_target_w) > threshold_pct:
-                                    do_rebalance = True
-                                    break # 只要有一檔偏離就觸發重整
+                                if t_name in asset_values:
+                                    t_target_w = asset['weight']
+                                    current_w = asset_values[t_name] / total_assets
+                                    if abs(current_w - t_target_w) > threshold_pct:
+                                        do_rebalance = True
+                                        break
 
                         # E. 執行再平衡
                         if do_rebalance and total_assets > 0:
-                            # 重新計算每一檔應該持有的金額
                             new_shares = {}
                             cost_of_stocks = 0
                             
@@ -177,12 +198,11 @@ if st.button("🚀 開始模擬", type="primary"):
                                 t_target_w = asset['weight']
                                 target_val = total_assets * t_target_w
                                 
-                                # 計算新股數
-                                new_s = target_val / row[t_name]
-                                new_shares[t_name] = new_s
-                                cost_of_stocks += target_val
+                                if t_name in row:
+                                    new_s = target_val / row[t_name]
+                                    new_shares[t_name] = new_s
+                                    cost_of_stocks += target_val
                             
-                            # 更新持股與現金
                             shares = new_shares
                             current_cash = total_assets - cost_of_stocks
 
@@ -193,7 +213,6 @@ if st.button("🚀 開始模擬", type="primary"):
                             "Total Invested": total_invested,
                             "Cash": current_cash
                         }
-                        # 加入個別資產價值
                         for t_name, val in asset_values.items():
                             record[t_name] = val
                             
@@ -202,26 +221,34 @@ if st.button("🚀 開始模擬", type="primary"):
                     # 5. 結果展示
                     df_res = pd.DataFrame(history)
                     
-                    final_nav = df_res.iloc[-1]['Net Worth']
-                    final_invested = df_res.iloc[-1]['Total Invested']
-                    total_profit = final_nav - final_invested
-                    roi = (total_profit / final_invested) * 100 if final_invested > 0 else 0
-                    
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("最終淨資產", f"${int(final_nav):,}")
-                    c2.metric("總投入本金", f"${int(final_invested):,}")
-                    c3.metric("總損益 (ROI)", f"${int(total_profit):,}", f"{roi:.2f}%")
-                    
-                    st.subheader("資產累積走勢")
-                    
-                    # 繪圖：只畫 Net Worth 和 Total Invested 保持清晰，詳細可看表格
-                    fig = px.line(df_res, x="Date", y=["Net Worth", "Total Invested"], 
-                                  title="淨值成長 vs 投入成本",
-                                  color_discrete_map={"Net Worth": "red", "Total Invested": "gray"})
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    with st.expander("查看詳細數據與個別資產價值"):
-                        st.dataframe(df_res.sort_values("Date", ascending=False))
+                    if df_res.empty:
+                        st.error("計算結果為空，請檢查資料來源。")
+                    else:
+                        final_nav = df_res.iloc[-1]['Net Worth']
+                        final_invested = df_res.iloc[-1]['Total Invested']
+                        total_profit = final_nav - final_invested
+                        roi = (total_profit / final_invested) * 100 if final_invested > 0 else 0
+                        
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("最終淨資產", f"${int(final_nav):,}")
+                        c2.metric("總投入本金", f"${int(final_invested):,}")
+                        c3.metric("總損益 (ROI)", f"${int(total_profit):,}", f"{roi:.2f}%")
+                        
+                        st.subheader("資產累積走勢")
+                        
+                        fig = px.line(df_res, x="Date", y=["Net Worth", "Total Invested"], 
+                                    title="淨值成長 vs 投入成本",
+                                    color_discrete_map={"Net Worth": "red", "Total Invested": "gray"})
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        with st.expander("查看詳細數據與個別資產價值"):
+                            st.dataframe(df_res.sort_values("Date", ascending=False))
 
             except Exception as e:
                 st.error(f"發生錯誤: {e}")
+                # 印出詳細錯誤以便除錯
+                import traceback
+                st.text(traceback.format_exc())
+
+else:
+    st.info("👈 請在左側設定參數，然後點擊按鈕開始。")
