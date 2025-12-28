@@ -115,9 +115,8 @@ def get_data_safe(ticker_list, start, end):
         return data.ffill().dropna()
     except Exception as e:
         return pd.DataFrame()
-
 # --- 4. 主程式邏輯 ---
-st.title("📈 全方位資產成長模擬器 (信貸還款完整版)")
+st.title("📈 全方位資產成長模擬器 (還款邏輯修復版)")
 
 # Session State 初始化
 if 'simulation_done' not in st.session_state: st.session_state.simulation_done = False
@@ -154,12 +153,24 @@ if st.button("🚀 開始模擬運算", type="primary"):
                 history = []
                 total_invested = initial_capital
                 
+                # --- 修正重點：月份偵測變數 ---
+                last_month = None
+                
                 # 逐日回測
                 for date, row in data.iterrows():
                     current_cash += current_cash * (cash_interest_rate / 365)
-                    is_month_start = date.is_month_start
                     
-                    if is_month_start:
+                    # --- 修正重點：更精準的月初判斷 (不管1號是不是假日都會觸發) ---
+                    current_month = date.month
+                    is_new_month = False
+                    if last_month is None:
+                        last_month = current_month
+                    elif current_month != last_month:
+                        is_new_month = True
+                        last_month = current_month
+                    
+                    # 只有在「換月」的第一個交易日執行扣款
+                    if is_new_month:
                         current_cash += monthly_cashflow
                         if monthly_cashflow > 0:
                             total_invested += monthly_cashflow
@@ -197,8 +208,10 @@ if st.button("🚀 開始模擬運算", type="primary"):
 
                     do_rebalance = False
                     if current_cash < 0: do_rebalance = True 
-                    if rebalance_mode == "每月 (Monthly)" and is_month_start: do_rebalance = True
+                    # 這裡也要同步修正：使用 is_new_month 來觸發再平衡
+                    if rebalance_mode == "每月 (Monthly)" and is_new_month: do_rebalance = True
                     elif rebalance_mode == "每年 (Yearly)" and date.is_year_start: do_rebalance = True
+                    
                     if threshold_mode and total_assets > 0:
                         for asset in assets:
                             t = asset['ticker']
@@ -229,6 +242,7 @@ if st.button("🚀 開始模擬運算", type="primary"):
                 st.session_state.df_res = pd.DataFrame(history)
                 st.session_state.simulation_done = True
                 st.rerun()
+
 
 # --- 顯示結果與進階分析 ---
 if st.session_state.simulation_done and st.session_state.df_res is not None:
